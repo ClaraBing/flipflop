@@ -1,0 +1,65 @@
+model_seed: 42
+
+config_name: "default"
+
+defaults:
+  - data: mod
+
+mode: "train"
+# mode: "eval"
+
+# Model configuration
+model:
+  max_seq_len: 128
+  emb_dropout: 0
+  attn_layers:
+    dim: 256
+    depth: 1
+    heads: 8
+    layer_dropout: 0
+  # the following are not used
+  use_conv1d_embed: 0
+  conv1d_embed:
+    kernel_size: 5
+    num_layers: 1
+  load_ckpt: 0
+  ckpt_path: ""
+
+# Data configuration
+data:
+  task: flipflop
+  length: 128
+  random_length: 0
+  seed: 42
+  n_states: 2
+  # the probability of ignores; comma-separated for a mixture.
+  p_ignores_train: '0.5'
+  p_ignores_val: '0.5'
+  # the number of ignores in a sequence
+  n_ignores_train: '' # NOTE: this overwrites p_ignores
+  n_ignores_val: '' # NOTE: this overwrites p_ignores
+  # number of samples (in an "epoch")
+  n_samples_train: 819200
+  n_samples_val: 8192
+  # the file to load the data from; overwrites all other settings
+  fdata_train: ''
+  fdata_val: ''
+  batch_size: 128
+  eval_batch_size: 512
+  num_workers: 8
+
+# Training configuration
+training:
+  lr: 1e-4
+  lr_schedule: cosine
+  weight_decay: 0
+  epochs: 1
+  steps: -1 # NOTE: currently unused
+  n_steps_to_eval: 100
+  n_steps_to_save: 1000
+
+# Wandb configuration
+wandb:
+  project: "flipflop2025"
+  name: ""
+  entity: 'bingbin'  # Set this to your wandb username 

@@ -1,0 +1,10 @@
+task: "mod_add"
+prime: 67
+n_numbers: 2 # adding 2 numbers
+n_tokens: 2
+token_range: 1000
+n_samples_train: 1000000
+n_samples_val: 10000
+batch_size: 64
+eval_batch_size: 1024
+mod_op: "add"
