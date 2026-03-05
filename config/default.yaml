@@ -10,13 +10,31 @@ mode: "train"
 
 # Model configuration
 model:
+  type: 'nanogpt'
   max_seq_len: 128
+  sequence_len: 128
   emb_dropout: 0
-  attn_layers:
-    dim: 256
-    depth: 1
-    heads: 8
-    layer_dropout: 0
+  vocab_size: -1 # Note: this can be set in `train.py`
+  dim: 256
+  depth: 1
+  heads: 8
+  layer_dropout: 0
+  qk_norm: 'rms_mininum'
+  ## Added for nanogpt
+  n_kv_head: 8
+  window_pattern: "SSSL"
+  # nanogpt:
+  #   vocab_size: 3
+  #   n_layer: 12
+  #   n_head: int = 6 # number of query heads
+  #   n_kv_head: int = 6 # number of key/value heads (GQA)
+  #   n_embd: int = 768
+  #   # Sliding window attention pattern string, tiled across layers. Final layer always L.
+  #   # Characters: L=long (full context), S=short (half context)
+  #   # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
+  #   window_pattern: str = "SSSL"
+  #   qk_norm: str = 'rms_mininum'
+
   # the following are not used
   use_conv1d_embed: 0
   conv1d_embed:
@@ -51,12 +69,14 @@ data:
 # Training configuration
 training:
   lr: 1e-4
-  lr_schedule: cosine
+  lr_schedule: cosine  # 'cosine' or 'none'
+  scheduler_eta_min: 0.0  # min LR for cosine schedule
   weight_decay: 0
   epochs: 1
   steps: -1 # NOTE: currently unused
   n_steps_to_eval: 100
   n_steps_to_save: 1000
+  weight_by_ignores: 0
 
 # Wandb configuration
 wandb:

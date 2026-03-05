@@ -83,9 +83,12 @@ class FlipFlopAutomaton:
             writes = self.np_rng.choice(range(1, self.n_states+1), size=T)
             x = writes * (1-ignore_pos)
             
-            return x, self.f(x)
+            y = self.f(x)
         else:
-            return self.X[idx], self.y[idx]
+            x = self.X[idx]
+            y = self.y[idx]
+        ignore_percentage = (x == 0).astype(float).mean().item()
+        return x, y, ignore_percentage
 
     def sample_length(self):
         if self.random_length:

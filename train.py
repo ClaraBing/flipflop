@@ -6,6 +6,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from x_transformers import TransformerWrapper, Decoder, Encoder
 
@@ -54,8 +55,10 @@ def main(cfg: DictConfig):
     cfg.data.n_samples_train = len(loader_train.dataset)
     cfg.data.n_samples_val = len(loader_val.dataset)
 
-    num_tokens = loader_train.dataset.n_states + 1 # +1 for the ignore
-    model = get_model(cfg, num_tokens)
+    if cfg.model.vocab_size == -1:
+      num_tokens = loader_train.dataset.n_states + 1 # +1 for the ignore
+      cfg.model.vocab_size = num_tokens
+    model = get_model(cfg.model)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -72,8 +75,15 @@ def main(cfg: DictConfig):
     # Define training loop
     ##########################################################################
     def train(model, loader, loaders_val, lr=1e-4, weight_decay=0, epochs=1, lr_schedule='cosine',
-             n_steps_to_eval=100, n_worst_samples=0):
+             n_steps_to_eval=100, n_worst_samples=0, scheduler_eta_min=0.0):
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        total_steps = len(loader) * epochs
+        if lr_schedule == 'cosine':
+            scheduler = lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_steps, eta_min=scheduler_eta_min
+            )
+        else:
+            scheduler = None
         model.train()
 
         step_count = 0
@@ -84,21 +94,23 @@ def main(cfg: DictConfig):
 
         for epoch_i in range(epochs):
             for batch in tqdm(loader, desc=f"Epoch {epoch_i+1}/{epochs}"):
-                x, y = batch[0].cuda().long(), batch[1].cuda().long()
+                x, y, ignore_percentage = batch[0].cuda().long(), batch[1].cuda().long(), batch[2].cuda().float()
                 logits = model(x)
-                loss = nn.CrossEntropyLoss()(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                if cfg.training.weight_by_ignores:
+                    loss = nn.CrossEntropyLoss(reduction='none')(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                    loss = (loss.reshape(logits.size(0), -1) * ignore_percentage.reshape(-1, 1)).mean()
+                else:
+                    loss = nn.CrossEntropyLoss()(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
+                if scheduler is not None:
+                    scheduler.step()
+
                 train_losses.append(loss.item())
                 step_count += 1
-
-                if lr_schedule == 'cosine':
-                    lr = 0.5 * (1 + np.cos(np.pi * step_count / (len(loader) * epochs))) * lr
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr
+                curr_lr = optimizer.param_groups[0]['lr']
 
                 # Evaluate occasionally
                 if step_count % n_steps_to_eval == 0 or step_count == 1:
@@ -118,7 +130,7 @@ def main(cfg: DictConfig):
                         'train_batch_acc': train_batch_acc,
                         'val_loss': val_losses[-1],
                         'val_acc': val_accs[-1],
-                        'curr_lr': lr,
+                        'curr_lr': curr_lr,
                     }, step=step_count)
 
                     # log model weight norms
@@ -172,13 +184,13 @@ def main(cfg: DictConfig):
         all_seq_accs = []
         all_seq_worst_pred = []
         for batch in loader:
-            xv, yv = batch[0].cuda().long(), batch[1].cuda().long()
+            xv, yv, _ = batch[0].cuda().long(), batch[1].cuda().long(), batch[2]
             logits_v = model(xv)
 
             # eval loss & acc
             loss_v = nn.CrossEntropyLoss(reduction='none')(logits_v.reshape(-1, logits_v.size(-1)), yv.reshape(-1))
             val_losses.append(loss_v.mean().item())
-            acc_v_by_seq = (torch.argmax(logits_v, dim=-1) == yv).float().mean(-1).item()
+            acc_v_by_seq = (torch.argmax(logits_v, dim=-1) == yv).float().mean(-1)
             val_accs.append(acc_v_by_seq.mean().item())
 
             if n_worst_samples > 0:
@@ -225,7 +237,8 @@ def main(cfg: DictConfig):
         weight_decay=cfg.training.weight_decay,
         epochs=cfg.training.epochs, 
         n_steps_to_eval=cfg.training.n_steps_to_eval,
-        lr_schedule=cfg.training.lr_schedule
+        lr_schedule=cfg.training.lr_schedule,
+        scheduler_eta_min=cfg.training.get('scheduler_eta_min', 0.0),
     )
 
     print("=== Training finished ===")
