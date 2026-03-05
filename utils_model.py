@@ -12,27 +12,29 @@ from x_transformers.x_transformers import LayerIntermediates
 from x_transformers.x_transformers import default, exists, first, cast_tuple
 from x_transformers.x_transformers import log, masked_mean, pad_at_dim, calc_entropy, calc_z_loss
 
+from nanochat.gpt import GPT
+
 import pdb
 
 
 
 class CustomTransformerWrapper(TransformerWrapper):
-    def __init__(self, cfg, attn_layers=None, num_tokens=None):
+    def __init__(self, cfg_model, attn_layers=None, num_tokens=None):
         super().__init__(
             num_tokens = num_tokens,
-            max_seq_len = cfg.model.max_seq_len,
+            max_seq_len = cfg_model.max_seq_len,
             attn_layers = attn_layers,
-            emb_dropout = cfg.model.emb_dropout,
+            emb_dropout = cfg_model.emb_dropout,
         )
-        self.use_conv1d_embed = cfg.model.use_conv1d_embed
+        self.use_conv1d_embed = cfg_model.use_conv1d_embed
         if self.use_conv1d_embed:
-            kernel_size = cfg.model.conv1d_embed.kernel_size
+            kernel_size = cfg_model.conv1d_embed.kernel_size
             padding = kernel_size // 2
             self.conv1d_after_embed = []
-            for _ in range(cfg.model.conv1d_embed.num_layers):
-                layer = nn.Conv1d(cfg.model.attn_layers.dim, cfg.model.attn_layers.dim,
+            for _ in range(cfg_model.conv1d_embed.num_layers):
+                layer = nn.Conv1d(cfg_model.attn_layers.dim, cfg_model.attn_layers.dim,
                                   kernel_size=kernel_size, padding=padding)
-                self.conv1d_after_embed += [layer, nn.BatchNorm1d(cfg.model.attn_layers.dim), nn.ReLU()]
+                self.conv1d_after_embed += [layer, nn.BatchNorm1d(cfg_model.attn_layers.dim), nn.ReLU()]
             self.conv1d_after_embed = nn.Sequential(*self.conv1d_after_embed)
         else:
             self.conv1d_after_embed = None
@@ -302,24 +304,26 @@ class CustomTransformerWrapper(TransformerWrapper):
 
         return out
 
-def get_model(cfg, num_tokens):
-
-    attn_layers = Encoder(
-            dim = cfg.model.attn_layers.dim,
-            depth = cfg.model.attn_layers.depth,
-            heads = cfg.model.attn_layers.heads,
-            layer_dropout = cfg.model.attn_layers.layer_dropout
-    )
-    model = CustomTransformerWrapper(
-        cfg = cfg,
-        num_tokens = num_tokens,
-        attn_layers = attn_layers,
-    )
+def get_model(cfg_model):
+    if cfg_model.type == 'nanogpt':
+      model = GPT(cfg_model)
+    elif cfg_model.type == 'transformer_wrapper':
+      attn_layers = Encoder(
+              dim = cfg_model.attn_layers.dim,
+              depth = cfg_model.attn_layers.depth,
+              heads = cfg_model.attn_layers.heads,
+              layer_dropout = cfg_model.attn_layers.layer_dropout
+      )
+      model = CustomTransformerWrapper(
+          cfg_model = cfg_model,
+          num_tokens = cfg_model.vocab_size,
+          attn_layers = attn_layers,
+      )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if cfg.model.load_ckpt and cfg.model.ckpt_path and os.path.exists(cfg.model.ckpt_path):
-        print(f"Loading checkpoint from {cfg.model.ckpt_path}")
-        state_dict = torch.load(cfg.model.ckpt_path, map_location=device)
+    if cfg_model.load_ckpt and cfg_model.ckpt_path and os.path.exists(cfg_model.ckpt_path):
+        print(f"Loading checkpoint from {cfg_model.ckpt_path}")
+        state_dict = torch.load(cfg_model.ckpt_path, map_location=device)
         model.load_state_dict(state_dict)
       
     model.to(device)
