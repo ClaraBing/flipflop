@@ -1,0 +1,74 @@
+model_seed: 42
+
+config_name: "default"
+
+mode: "train"
+# mode: "eval"
+
+# Model configuration
+# Note: JAX transformer uses D (d_model), L (n_layers), M (d_mlp), H (n_heads), K (d_head), V (vocab_size)
+model:
+  # Core transformer dimensions
+  D: 256  # d_model
+  L: 1    # n_layers
+  M: 1024 # d_mlp (typically 4x D)
+  H: 8    # n_heads
+  K: 32   # d_head (typically D // H)
+  V: -1   # vocab_size (will be set automatically based on n_states + 1)
+  
+  # Transformer options
+  fsdp: false  # whether to use FSDP (Fully Sharded Data Parallel)
+  scan_unroll: true  # unroll scan for better performance
+  dtype: "bfloat16"  # "float32", "float16", or "bfloat16"
+  norm_dtype: null  # dtype for normalization (null = use model dtype)
+  norm_eps: 1e-6
+  rope_dtype: null  # dtype for rotary embedding (null = use model dtype)
+  rope_freq: 10000  # rotary embedding frequency
+  flash_attention: true  # use flash attention if available
+  grad_checkpoint: false  # use gradient checkpointing
+  
+  # Checkpointing
+  load_ckpt: 0
+  ckpt_path: ""
+
+# Data configuration
+data:
+  task: flipflop
+  length: 128
+  random_length: 0
+  seed: 42
+  n_states: 2
+  # the probability of ignores; comma-separated for a mixture.
+  p_ignores_train: '0.5'
+  p_ignores_val: '0.5'
+  # the number of ignores in a sequence
+  n_ignores_train: '' # NOTE: this overwrites p_ignores
+  n_ignores_val: '' # NOTE: this overwrites p_ignores
+  # number of samples (in an "epoch")
+  n_samples_train: 819200
+  n_samples_val: 8192
+  # the file to load the data from; overwrites all other settings
+  fdata_train: ''
+  fdata_val: ''
+  batch_size: 128
+  eval_batch_size: 512
+  num_workers: 8  # Note: JAX doesn't use num_workers, but kept for compatibility
+
+# Training configuration
+training:
+  lr: 1e-4
+  lr_schedule: cosine  # 'cosine' or 'none'
+  scheduler_eta_min: 0.0  # min LR for cosine schedule
+  weight_decay: 0
+  epochs: 1
+  steps: -1 # NOTE: currently unused
+  n_steps_to_eval: 100
+  n_steps_to_save: 1000
+  weight_by_ignores: 0
+  optimizer: adam  # 'adam' or 'sgd'
+
+# Wandb configuration
+wandb:
+  project: "flipflop2025"
+  name: ""
+  entity: 'bingbin'  # Set this to your wandb username

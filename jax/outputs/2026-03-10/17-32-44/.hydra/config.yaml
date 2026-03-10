@@ -1,0 +1,53 @@
+model_seed: 1
+config_name: ''
+mode: train
+model:
+  D: 256
+  L: 1
+  M: 1024
+  H: 1
+  K: 256
+  V: -1
+  fsdp: false
+  scan_unroll: true
+  dtype: bfloat16
+  norm_dtype: null
+  norm_eps: 1.0e-06
+  rope_dtype: null
+  rope_freq: 10000
+  flash_attention: true
+  grad_checkpoint: false
+  load_ckpt: 0
+  ckpt_path: ''
+data:
+  task: flipflop
+  length: 64
+  random_length: 0
+  seed: 1
+  n_states: 2
+  p_ignores_train: ''
+  p_ignores_val: ''
+  n_ignores_train: 1;60
+  n_ignores_val: 1;20;36;50;63
+  n_samples_train: 1024000
+  n_samples_val: 2048
+  fdata_train: ''
+  fdata_val: ''
+  batch_size: 128
+  eval_batch_size: 512
+  num_workers: 8
+training:
+  lr: 0.001
+  lr_schedule: constant
+  scheduler_eta_min: 0.0
+  weight_decay: 0
+  epochs: 1
+  steps: -1
+  n_steps_to_eval: 1000
+  n_steps_to_save: 1000
+  weight_by_ignores: 1
+  optimizer: adam
+wandb:
+  project: flipflop2025
+  name: _1
+  entity: bingbin

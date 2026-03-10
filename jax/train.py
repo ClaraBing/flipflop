@@ -1,0 +1,370 @@
+import os
+import pickle
+import numpy as np
+from tqdm import tqdm
+
+import jax
+import optax
+from jax import numpy as jnp
+from jax import random as jr
+
+from omegaconf import DictConfig, OmegaConf
+import hydra
+from hydra.utils import get_original_cwd
+
+import datetime
+import wandb
+
+from src.transformer import Transformer
+from src.opt import Adam, SGD
+from src.utils_data import get_loaders, FlipFlopAutomaton
+
+VERBOSE = 0
+N_VALS_TO_LOG = 10
+
+
+@hydra.main(version_base=None, config_path=os.path.join(os.path.dirname(__file__), "config"), config_name="default")
+def main(cfg: DictConfig):
+
+    if VERBOSE:
+        print(OmegaConf.to_yaml(cfg))
+
+    # Set seeds
+    key = jr.PRNGKey(cfg.model_seed)
+    np.random.seed(cfg.data.seed)
+
+    ##########################################################################
+    # Get the loaders & model
+    ##########################################################################
+    train_loader_fn, val_loader_fn = get_loaders(cfg.data)
+    
+    # Get dataset to determine vocab size
+    train_set = None
+    for batch in train_loader_fn():
+        # Create a dummy dataset to get n_states
+        # We'll need to access the dataset directly
+        break
+    
+    # We need to create the datasets to get n_states
+    # Let's recreate them temporarily
+    temp_train_set = FlipFlopAutomaton(
+        cfg.data.n_states, cfg.data.length, cfg.data.random_length, cfg.data.seed,
+        cfg.data.n_ignores_train, cfg.data.p_ignores_train, cfg.data.n_samples_train,
+        cfg.data.fdata_train
+    )
+    temp_val_set = FlipFlopAutomaton(
+        cfg.data.n_states, cfg.data.length, cfg.data.random_length, cfg.data.seed,
+        cfg.data.n_ignores_val, cfg.data.p_ignores_val, cfg.data.n_samples_val,
+        cfg.data.fdata_val
+    )
+    
+    cfg.data.n_samples_train = len(temp_train_set)
+    cfg.data.n_samples_val = len(temp_val_set)
+
+    # Determine vocab size
+    if cfg.model.V == -1:
+        num_tokens = temp_train_set.n_states + 1  # +1 for the ignore token
+        cfg.model.V = num_tokens
+    
+    # Initialize model
+    model = Transformer(
+        D=cfg.model.D,
+        L=cfg.model.L,
+        M=cfg.model.M,
+        H=cfg.model.H,
+        K=cfg.model.K,
+        V=cfg.model.V,
+        fsdp=cfg.model.get('fsdp', False),
+        scan_unroll=cfg.model.get('scan_unroll', True),
+        dtype=cfg.model.get('dtype', 'bfloat16'),
+        norm_dtype=cfg.model.get('norm_dtype', None),
+        norm_eps=cfg.model.get('norm_eps', 1e-6),
+        rope_dtype=cfg.model.get('rope_dtype', None),
+        rope_freq=cfg.model.get('rope_freq', 10000),
+        flash_attention=cfg.model.get('flash_attention', True),
+        grad_checkpoint=cfg.model.get('grad_checkpoint', False),
+    )
+    
+    key, init_key = jr.split(key)
+    params = model.init(init_key)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # create a wandb run
+    wandb.init(project=cfg.wandb.project,
+               config=OmegaConf.to_container(cfg, resolve=True),
+               name=f"{cfg.wandb.name}_{timestamp}",
+               entity=cfg.wandb.entity)
+    
+    os.makedirs(f"checkpoints/{cfg.wandb.name}_{timestamp}", exist_ok=True)
+
+    def save_params(params, path):
+        """Save JAX parameters to pickle file."""
+        # Convert JAX arrays to numpy for serialization
+        params_numpy = jax.tree.map(lambda x: np.array(x) if isinstance(x, jnp.ndarray) else x, params)
+        with open(path, 'wb') as f:
+            pickle.dump(params_numpy, f)
+
+    def load_params(path):
+        """Load JAX parameters from pickle file."""
+        with open(path, 'rb') as f:
+            params_numpy = pickle.load(f)
+        # Convert numpy arrays back to JAX arrays
+        params = jax.tree.map(lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x, params_numpy)
+        return params
+
+    # Load checkpoint if specified
+    if cfg.model.load_ckpt and cfg.model.ckpt_path and os.path.exists(cfg.model.ckpt_path):
+        print(f"Loading checkpoint from {cfg.model.ckpt_path}")
+        params = load_params(cfg.model.ckpt_path)
+
+    ##########################################################################
+    # Define training loop
+    ##########################################################################
+    def train(model, params, train_loader_fn, val_loader_fn, lr=1e-4, weight_decay=0, 
+              epochs=1, lr_schedule='cosine', n_steps_to_eval=100, n_worst_samples=0, 
+              scheduler_eta_min=0.0, weight_by_ignores=False):
+        
+        # Setup optimizer
+        if cfg.training.get('optimizer', 'adam') == 'adam':
+            optimizer = Adam(lr=lr, b1=0.9, b2=0.95, eps=1e-8)
+        else:
+            optimizer = SGD(lr=lr, momentum=0.9)
+        
+        base_optimizer = optimizer.build(model.lrs)
+        
+        # Add weight decay if specified
+        if weight_decay > 0:
+            base_optimizer = optax.chain(
+                optax.add_decayed_weights(weight_decay),
+                base_optimizer
+            )
+        
+        # Setup learning rate schedule
+        total_steps = cfg.data.n_samples_train // cfg.data.batch_size * epochs
+        if lr_schedule == 'cosine':
+            schedule = optax.cosine_decay_schedule(
+                init_value=lr,
+                decay_steps=total_steps,
+                alpha=scheduler_eta_min / lr if lr > 0 else 0.0
+            )
+            # Chain the schedule with the optimizer (schedule should come first)
+            opt_update = optax.chain(
+                optax.scale_by_schedule(schedule),
+                base_optimizer
+            )
+        else:
+            opt_update = base_optimizer
+        
+        opt_state = opt_update.init(params)
+
+        # Define loss function
+        def loss_fn(params, x, y, ignore_percentage=None):
+            logits = model.apply(params, x)
+            # logits: [batch_size, seq_len, vocab_size]
+            # y: [batch_size, seq_len]
+            logits_flat = logits.reshape(-1, logits.shape[-1])
+            y_flat = y.reshape(-1)
+            
+            if weight_by_ignores and ignore_percentage is not None:
+                # Weight loss by ignore percentage
+                loss_per_token = optax.softmax_cross_entropy_with_integer_labels(logits_flat, y_flat)
+                loss_per_seq = loss_per_token.reshape(logits.shape[0], -1)
+                weights = ignore_percentage.reshape(-1, 1)
+                loss = (loss_per_seq * weights).mean()
+            else:
+                loss = optax.softmax_cross_entropy_with_integer_labels(logits_flat, y_flat).mean()
+            return loss
+
+        # JIT compile the gradient function (includes loss computation)
+        grad_fn = jax.jit(jax.value_and_grad(loss_fn))
+
+        step_count = 0
+        train_losses = []
+        val_losses, val_accs = [], []
+
+        best_val_loss = float('inf')
+        worst_samples = None
+
+        # Training key for shuffling
+        train_key = jr.PRNGKey(42)
+
+        for epoch_i in range(epochs):
+            train_loader = train_loader_fn(key=train_key)
+            
+            for batch in tqdm(train_loader, desc=f"Epoch {epoch_i+1}/{epochs}"):
+                x, y, ignore_percentage = batch
+                x = x.astype(jnp.int32)
+                y = y.astype(jnp.int32)
+                ignore_percentage = ignore_percentage.astype(jnp.float32)
+
+                # Compute loss and gradients
+                loss, grads = grad_fn(params, x, y, ignore_percentage if weight_by_ignores else None)
+                
+                # Update parameters
+                updates, opt_state = opt_update.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+                train_losses.append(float(loss))
+                step_count += 1
+
+                # Get current learning rate
+                if lr_schedule == 'cosine':
+                    curr_lr = float(schedule(step_count))
+                else:
+                    curr_lr = lr
+
+                # Evaluate occasionally
+                if step_count % n_steps_to_eval == 0 or step_count == 1:
+                    # Compute training accuracy on current batch
+                    logits = model.apply(params, x)
+                    train_batch_acc = (jnp.argmax(logits, axis=-1) == y).astype(float).mean().item()
+                    avg_train_loss = np.mean(train_losses[-10:])
+                    
+                    # Evaluate on val set
+                    val_loss, val_acc, worst_samples = eval_model(
+                        model, params, val_loader_fn, n_worst_samples=n_worst_samples
+                    )
+                    val_losses.append(val_loss)
+                    val_accs.append(val_acc)
+
+                    # Log to wandb
+                    log_dict = {
+                        'train_loss': avg_train_loss,
+                        'train_batch_acc': train_batch_acc,
+                        'val_loss': val_losses[-1],
+                        'val_acc': val_accs[-1],
+                        'curr_lr': curr_lr,
+                    }
+                    
+                    # log model weight norms
+                    weight_norms = {}
+                    def _log_norms(path, param):
+                        name = '/'.join(str(p) for p in path)
+                        l1_norm = jnp.abs(param).sum().item()
+                        l2_norm = jnp.linalg.norm(param).item()
+                        # Frobenius norm: for 1D use L2; for 2D+ use L2 norm of flattened (ord='fro' only supports 1D/2D)
+                        lfro_norm = l2_norm if param.ndim == 1 else jnp.linalg.norm(param.ravel()).item()
+                        linf_norm = jnp.abs(param).max().item()
+                        weight_norms[name + '_l1'] = l1_norm
+                        weight_norms[name + '_l2'] = l2_norm
+                        weight_norms[name + '_fro'] = lfro_norm
+                        weight_norms[name + '_inf'] = linf_norm
+                    
+                    jax.tree.map_with_path(_log_norms, params)
+                    log_dict.update(weight_norms)
+                    
+                    wandb.log(log_dict, step=step_count)
+
+                    # Print to console
+                    print(f"Step {step_count}: train_loss={avg_train_loss:.4f} / train_acc: {train_batch_acc:.4f}")
+                    print(f"val_loss: {val_loss:.4f} / val_acc: {val_acc:.4f}")
+                    
+                    # save the model
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_params(params, f"checkpoints/{cfg.wandb.name}_{timestamp}/best.pkl")
+                    save_params(params, f"checkpoints/{cfg.wandb.name}_{timestamp}/last.pkl")
+
+                    # Check for early stopping
+                    if len(val_losses) > 10 and np.mean(val_losses[-10:]) < 1e-8:
+                        print("Early stopping at loss < 1e-8")
+                        return train_losses, val_losses, val_accs
+  
+                if step_count % cfg.training.n_steps_to_save == 0 or step_count == 1:
+                    save_params(params, f"checkpoints/{cfg.wandb.name}_{timestamp}/step{step_count}.pkl")
+
+            # Update training dataset with worst samples if needed
+            if worst_samples is not None and step_count > 1:
+                # Note: This would require modifying the dataset, which is more complex in JAX
+                # For now, we'll skip this feature or implement it differently
+                pass
+
+        # save the model
+        save_params(params, f"checkpoints/{cfg.wandb.name}_{timestamp}/last.pkl")
+
+        return train_losses, val_losses, val_accs
+
+
+    def eval_model(model, params, val_loader_fn, n_samples=-1, n_worst_samples=0):
+        val_losses, val_accs = [], []
+        samples_count = 0
+        all_samples_X = []
+        all_samples_y = []
+        all_seq_accs = []
+        all_seq_worst_pred = []
+        
+        val_loader = val_loader_fn()
+        
+        for batch in val_loader:
+            xv, yv, _ = batch
+            xv = xv.astype(jnp.int32)
+            yv = yv.astype(jnp.int32)
+            
+            logits_v = model.apply(params, xv)
+
+            # eval loss & acc
+            logits_flat = logits_v.reshape(-1, logits_v.shape[-1])
+            yv_flat = yv.reshape(-1)
+            loss_per_token = optax.softmax_cross_entropy_with_integer_labels(logits_flat, yv_flat)
+            loss_per_seq = loss_per_token.reshape(xv.shape[0], -1)
+            
+            val_losses.append(float(loss_per_seq.mean()))
+            acc_v_by_seq = (jnp.argmax(logits_v, axis=-1) == yv).astype(float).mean(axis=-1)
+            val_accs.append(float(acc_v_by_seq.mean()))
+
+            if n_worst_samples > 0:
+                all_samples_X.append(xv)
+                all_samples_y.append(yv)
+                all_seq_accs.append(acc_v_by_seq)
+                max_loss_per_seq = jnp.max(loss_per_seq, axis=-1)
+                all_seq_worst_pred.append(max_loss_per_seq)
+
+            if n_samples > 0 and samples_count >= n_samples:
+                break
+            samples_count += xv.shape[0]
+        
+        if n_worst_samples > 0:
+            # select the worse samples according to per-seq accuracy or per-seq max loss
+            all_samples_X = jnp.concatenate(all_samples_X, axis=0)
+            all_samples_y = jnp.concatenate(all_samples_y, axis=0)
+            all_seq_accs = jnp.concatenate(all_seq_accs, axis=0)
+            all_seq_worst_pred = jnp.concatenate(all_seq_worst_pred, axis=0)
+
+            n_worst_samples = min(n_worst_samples, all_samples_X.shape[0])
+            worst_idx_by_acc = jnp.argsort(all_seq_accs)[:n_worst_samples//2]
+            worst_idx_by_loss = jnp.argsort(all_seq_worst_pred)[-n_worst_samples//2:]
+            # remove duplicates
+            worst_idx = jnp.concatenate([worst_idx_by_acc, worst_idx_by_loss])
+            worst_idx = jnp.unique(worst_idx)
+            worst_samples_X = all_samples_X[worst_idx]
+            worst_samples_y = all_samples_y[worst_idx]
+            worst_samples = {'X': worst_samples_X, 'y': worst_samples_y}
+        else:
+            worst_samples = None
+            
+        return np.mean(val_losses), np.mean(val_accs), worst_samples
+
+    ##########################################################################
+    # Train the model
+    ##########################################################################
+    print("=== Training joint mixture model ===")
+    train_losses, val_losses, val_accs = train(
+        model, 
+        params,
+        train_loader_fn,
+        val_loader_fn,
+        lr=cfg.training.lr, 
+        weight_decay=cfg.training.weight_decay,
+        epochs=cfg.training.epochs, 
+        n_steps_to_eval=cfg.training.n_steps_to_eval,
+        lr_schedule=cfg.training.lr_schedule,
+        scheduler_eta_min=cfg.training.get('scheduler_eta_min', 0.0),
+        weight_by_ignores=cfg.training.get('weight_by_ignores', False),
+    )
+
+    print("=== Training finished ===")
+
+
+if __name__ == "__main__":
+    main()
