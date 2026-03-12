@@ -167,21 +167,20 @@ def get_loaders(cfg_data):
         raise ValueError(f"Task {cfg_data.task} not supported")
     
     def batch_generator(dataset, batch_size, shuffle=True, key=None):
-        """Generate batches from dataset."""
+        """Generate batches from dataset. Uses direct array indexing (no per-sample .item() syncs)."""
         n_samples = len(dataset)
         indices = jnp.arange(n_samples)
-        
         if shuffle:
             if key is None:
                 key = jr.PRNGKey(42)
             key, subkey = jr.split(key)
             indices = jr.permutation(subkey, indices)
-        
         for i in range(0, n_samples, batch_size):
-            batch_indices = indices[i:i+batch_size]
-            batch_x = jnp.array([dataset[int(idx)][0] for idx in batch_indices])
-            batch_y = jnp.array([dataset[int(idx)][1] for idx in batch_indices])
-            batch_ignore = jnp.array([dataset[int(idx)][2] for idx in batch_indices])
+            batch_indices = indices[i:i + batch_size]
+            batch_x = dataset.X[batch_indices]
+            batch_y = dataset.y[batch_indices]
+            # Vectorized ignore percentage per sample (no device round-trips)
+            batch_ignore = (batch_x == 0).astype(jnp.float32).mean(axis=-1)
             yield batch_x, batch_y, batch_ignore
     
     def train_loader(key=None):

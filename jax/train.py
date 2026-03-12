@@ -176,8 +176,68 @@ def main(cfg: DictConfig):
                 loss = optax.softmax_cross_entropy_with_integer_labels(logits_flat, y_flat).mean()
             return loss
 
-        # JIT compile the gradient function (includes loss computation)
-        grad_fn = jax.jit(jax.value_and_grad(loss_fn))
+        # Single jitted step: loss + grad + optimizer update (one XLA call per step)
+        def step_fn(params, opt_state, x, y, ignore_pct):
+            ignore_pct = ignore_pct if weight_by_ignores else None
+            loss, grads = jax.value_and_grad(loss_fn)(params, x, y, ignore_pct)
+            updates, new_opt_state = opt_update.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, loss
+
+        step_fn = jax.jit(step_fn)
+        # Jitted forward for eval and train_batch_acc (avoids recompilation from raw model.apply)
+        apply_fn = jax.jit(model.apply)
+
+        def eval_batch_loss_acc(params, xv, yv):
+            """Jitted: forward + loss + acc for one batch (single device round-trip)."""
+            logits_v = apply_fn(params, xv)
+            logits_flat = logits_v.reshape(-1, logits_v.shape[-1])
+            yv_flat = yv.reshape(-1)
+            loss_per_token = optax.softmax_cross_entropy_with_integer_labels(logits_flat, yv_flat)
+            loss_per_seq = loss_per_token.reshape(xv.shape[0], -1)
+            batch_loss = loss_per_seq.mean()
+            acc_v_by_seq = (jnp.argmax(logits_v, axis=-1) == yv).astype(jnp.float32).mean(axis=-1)
+            batch_acc = acc_v_by_seq.mean()
+            return batch_loss, batch_acc, logits_v, loss_per_seq, acc_v_by_seq
+
+        eval_batch_jit = jax.jit(eval_batch_loss_acc)
+
+        def eval_model(apply_fn, params, val_loader_fn, n_samples=-1, n_worst_samples=0):
+            val_losses, val_accs = [], []
+            samples_count = 0
+            all_samples_X = []
+            all_samples_y = []
+            all_seq_accs = []
+            all_seq_worst_pred = []
+            val_loader = val_loader_fn()
+            for batch in val_loader:
+                xv, yv, _ = batch
+                xv = jnp.asarray(xv, dtype=jnp.int32)
+                yv = jnp.asarray(yv, dtype=jnp.int32)
+                batch_loss, batch_acc, logits_v, loss_per_seq, acc_v_by_seq = eval_batch_jit(params, xv, yv)
+                val_losses.append(float(batch_loss))
+                val_accs.append(float(batch_acc))
+                if n_worst_samples > 0:
+                    all_samples_X.append(xv)
+                    all_samples_y.append(yv)
+                    all_seq_accs.append(acc_v_by_seq)
+                    all_seq_worst_pred.append(jnp.max(loss_per_seq, axis=-1))
+                if n_samples > 0 and samples_count >= n_samples:
+                    break
+                samples_count += xv.shape[0]
+            if n_worst_samples > 0:
+                all_samples_X = jnp.concatenate(all_samples_X, axis=0)
+                all_samples_y = jnp.concatenate(all_samples_y, axis=0)
+                all_seq_accs = jnp.concatenate(all_seq_accs, axis=0)
+                all_seq_worst_pred = jnp.concatenate(all_seq_worst_pred, axis=0)
+                n_sel = min(n_worst_samples, all_samples_X.shape[0])
+                worst_idx_by_acc = jnp.argsort(all_seq_accs)[:n_sel // 2]
+                worst_idx_by_loss = jnp.argsort(all_seq_worst_pred)[-n_sel // 2:]
+                worst_idx = jnp.unique(jnp.concatenate([worst_idx_by_acc, worst_idx_by_loss]))
+                worst_samples = {'X': all_samples_X[worst_idx], 'y': all_samples_y[worst_idx]}
+            else:
+                worst_samples = None
+            return np.mean(val_losses), np.mean(val_accs), worst_samples
 
         step_count = 0
         train_losses = []
@@ -194,16 +254,12 @@ def main(cfg: DictConfig):
             
             for batch in tqdm(train_loader, desc=f"Epoch {epoch_i+1}/{epochs}"):
                 x, y, ignore_percentage = batch
-                x = x.astype(jnp.int32)
-                y = y.astype(jnp.int32)
-                ignore_percentage = ignore_percentage.astype(jnp.float32)
+                x = jnp.asarray(x, dtype=jnp.int32)
+                y = jnp.asarray(y, dtype=jnp.int32)
+                ignore_percentage = jnp.asarray(ignore_percentage, dtype=jnp.float32)
 
-                # Compute loss and gradients
-                loss, grads = grad_fn(params, x, y, ignore_percentage if weight_by_ignores else None)
-                
-                # Update parameters
-                updates, opt_state = opt_update.update(grads, opt_state, params)
-                params = optax.apply_updates(params, updates)
+                # Single jitted step (forward + backward + optimizer update)
+                params, opt_state, loss = step_fn(params, opt_state, x, y, ignore_percentage)
 
                 train_losses.append(float(loss))
                 step_count += 1
@@ -216,14 +272,14 @@ def main(cfg: DictConfig):
 
                 # Evaluate occasionally
                 if step_count % n_steps_to_eval == 0 or step_count == 1:
-                    # Compute training accuracy on current batch
-                    logits = model.apply(params, x)
-                    train_batch_acc = (jnp.argmax(logits, axis=-1) == y).astype(float).mean().item()
+                    # Compute training accuracy on current batch (jitted forward)
+                    logits = apply_fn(params, x)
+                    train_batch_acc = float((jnp.argmax(logits, axis=-1) == y).astype(jnp.float32).mean())
                     avg_train_loss = np.mean(train_losses[-10:])
                     
-                    # Evaluate on val set
+                    # Evaluate on val set (uses jitted apply inside)
                     val_loss, val_acc, worst_samples = eval_model(
-                        model, params, val_loader_fn, n_worst_samples=n_worst_samples
+                        apply_fn, params, val_loader_fn, n_worst_samples=n_worst_samples
                     )
                     val_losses.append(val_loss)
                     val_accs.append(val_acc)
@@ -237,21 +293,17 @@ def main(cfg: DictConfig):
                         'curr_lr': curr_lr,
                     }
                     
-                    # log model weight norms
+                    # Log model weight norms (single device sync via device_get)
+                    params_cpu = jax.device_get(params)
                     weight_norms = {}
                     def _log_norms(path, param):
                         name = '/'.join(str(p) for p in path)
-                        l1_norm = jnp.abs(param).sum().item()
-                        l2_norm = jnp.linalg.norm(param).item()
-                        # Frobenius norm: for 1D use L2; for 2D+ use L2 norm of flattened (ord='fro' only supports 1D/2D)
-                        lfro_norm = l2_norm if param.ndim == 1 else jnp.linalg.norm(param.ravel()).item()
-                        linf_norm = jnp.abs(param).max().item()
-                        weight_norms[name + '_l1'] = l1_norm
-                        weight_norms[name + '_l2'] = l2_norm
-                        weight_norms[name + '_fro'] = lfro_norm
-                        weight_norms[name + '_inf'] = linf_norm
-                    
-                    jax.tree.map_with_path(_log_norms, params)
+                        p = np.asarray(param)
+                        weight_norms[name + '_l1'] = float(np.abs(p).sum())
+                        weight_norms[name + '_l2'] = float(np.linalg.norm(p))
+                        weight_norms[name + '_fro'] = float(np.linalg.norm(p.ravel()))
+                        weight_norms[name + '_inf'] = float(np.abs(p).max())
+                    jax.tree.map_with_path(_log_norms, params_cpu)
                     log_dict.update(weight_norms)
                     
                     wandb.log(log_dict, step=step_count)
@@ -284,66 +336,6 @@ def main(cfg: DictConfig):
         save_params(params, f"checkpoints/{cfg.wandb.name}_{timestamp}/last.pkl")
 
         return train_losses, val_losses, val_accs
-
-
-    def eval_model(model, params, val_loader_fn, n_samples=-1, n_worst_samples=0):
-        val_losses, val_accs = [], []
-        samples_count = 0
-        all_samples_X = []
-        all_samples_y = []
-        all_seq_accs = []
-        all_seq_worst_pred = []
-        
-        val_loader = val_loader_fn()
-        
-        for batch in val_loader:
-            xv, yv, _ = batch
-            xv = xv.astype(jnp.int32)
-            yv = yv.astype(jnp.int32)
-            
-            logits_v = model.apply(params, xv)
-
-            # eval loss & acc
-            logits_flat = logits_v.reshape(-1, logits_v.shape[-1])
-            yv_flat = yv.reshape(-1)
-            loss_per_token = optax.softmax_cross_entropy_with_integer_labels(logits_flat, yv_flat)
-            loss_per_seq = loss_per_token.reshape(xv.shape[0], -1)
-            
-            val_losses.append(float(loss_per_seq.mean()))
-            acc_v_by_seq = (jnp.argmax(logits_v, axis=-1) == yv).astype(float).mean(axis=-1)
-            val_accs.append(float(acc_v_by_seq.mean()))
-
-            if n_worst_samples > 0:
-                all_samples_X.append(xv)
-                all_samples_y.append(yv)
-                all_seq_accs.append(acc_v_by_seq)
-                max_loss_per_seq = jnp.max(loss_per_seq, axis=-1)
-                all_seq_worst_pred.append(max_loss_per_seq)
-
-            if n_samples > 0 and samples_count >= n_samples:
-                break
-            samples_count += xv.shape[0]
-        
-        if n_worst_samples > 0:
-            # select the worse samples according to per-seq accuracy or per-seq max loss
-            all_samples_X = jnp.concatenate(all_samples_X, axis=0)
-            all_samples_y = jnp.concatenate(all_samples_y, axis=0)
-            all_seq_accs = jnp.concatenate(all_seq_accs, axis=0)
-            all_seq_worst_pred = jnp.concatenate(all_seq_worst_pred, axis=0)
-
-            n_worst_samples = min(n_worst_samples, all_samples_X.shape[0])
-            worst_idx_by_acc = jnp.argsort(all_seq_accs)[:n_worst_samples//2]
-            worst_idx_by_loss = jnp.argsort(all_seq_worst_pred)[-n_worst_samples//2:]
-            # remove duplicates
-            worst_idx = jnp.concatenate([worst_idx_by_acc, worst_idx_by_loss])
-            worst_idx = jnp.unique(worst_idx)
-            worst_samples_X = all_samples_X[worst_idx]
-            worst_samples_y = all_samples_y[worst_idx]
-            worst_samples = {'X': worst_samples_X, 'y': worst_samples_y}
-        else:
-            worst_samples = None
-            
-        return np.mean(val_losses), np.mean(val_accs), worst_samples
 
     ##########################################################################
     # Train the model
