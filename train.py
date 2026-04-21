@@ -9,6 +9,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn.functional as F
 from x_transformers import TransformerWrapper, Decoder, Encoder
+from sympy import factorial
 
 from omegaconf import DictConfig, OmegaConf
 import hydra
@@ -56,8 +57,15 @@ def main(cfg: DictConfig):
     cfg.data.n_samples_val = len(loader_val.dataset)
 
     if cfg.model.vocab_size == -1:
-      num_tokens = loader_train.dataset.n_states + 1 # +1 for the ignore
-      cfg.model.vocab_size = num_tokens
+        if cfg.data.task == 'flipflop':
+          num_tokens = loader_train.dataset.n_states + 1 # +1 for the ignore
+        elif cfg.data.task == 'symmetric' or cfg.data.task == 'alternating':
+          num_tokens = int(factorial(loader_train.dataset.n_states))
+        else:
+          raise ValueError(f"Task {cfg.data.task} not supported")
+        cfg.model.vocab_size = num_tokens
+    else:
+        cfg.model.vocab_size = cfg.model.vocab_size
     model = get_model(cfg.model)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -94,9 +102,14 @@ def main(cfg: DictConfig):
 
         for epoch_i in range(epochs):
             for batch in tqdm(loader, desc=f"Epoch {epoch_i+1}/{epochs}"):
-                x, y, ignore_percentage = batch[0].cuda().long(), batch[1].cuda().long(), batch[2].cuda().float()
+                x = batch[0].cuda().long()
+                y = batch[1].cuda().long()
+                if len(batch) == 3:
+                    ignore_percentage = batch[2].cuda().float()
+                else:
+                    ignore_percentage = None
                 logits = model(x)
-                if cfg.training.weight_by_ignores:
+                if ignore_percentage is not None and cfg.training.weight_by_ignores:
                     loss = nn.CrossEntropyLoss(reduction='none')(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
                     loss = (loss.reshape(logits.size(0), -1) * ignore_percentage.reshape(-1, 1)).mean()
                 else:
@@ -184,7 +197,8 @@ def main(cfg: DictConfig):
         all_seq_accs = []
         all_seq_worst_pred = []
         for batch in loader:
-            xv, yv, _ = batch[0].cuda().long(), batch[1].cuda().long(), batch[2]
+            xv = batch[0].cuda().long()
+            yv = batch[1].cuda().long()
             logits_v = model(xv)
 
             # eval loss & acc

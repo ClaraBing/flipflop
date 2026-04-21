@@ -50,6 +50,11 @@ data:
   random_length: 0
   seed: 42
   n_states: 2
+  # For permutation-group tasks ('symmetric', 'alternating'):
+  # - SymmetricAutomaton uses: label_type, n_actions
+  # - AlternatingAutomaton uses: label_type
+  label_type: state  # 'state' or 'first_chair'
+  n_actions: 3
   # the probability of ignores; comma-separated for a mixture.
   p_ignores_train: '0.5'
   p_ignores_val: '0.5'
@@ -80,6 +85,6 @@ training:
 
 # Wandb configuration
 wandb:
-  project: "flipflop2025"
+  project: "flipflop"
   name: ""
   entity: 'bingbin'  # Set this to your wandb username 
