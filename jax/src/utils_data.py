@@ -5,11 +5,14 @@ from tqdm import tqdm
 import jax
 from jax import numpy as jnp
 from jax import random as jr
+import numpy as np
+import itertools
 
 
 class FlipFlopAutomaton:
     # NOTE: code adapted from https://huggingface.co/datasets/synthseq/automata/blob/main/automata.py
-    def __init__(self, n_states, length, random_length, seed, n_ignores, p_ignores, n_samples, fdata):
+    def __init__(self, n_states, length, random_length, seed, n_ignores, p_ignores, n_samples, fdata,
+                 display=None):
         self.name = 'flipflop'
 
         self.n_states = n_states
@@ -19,6 +22,10 @@ class FlipFlopAutomaton:
         self.n_ignores = n_ignores
         self.p_ignores = p_ignores
         self.n_samples = n_samples
+
+        if display is None:
+            display = f"n_ignores={n_ignores}, p_ignores={p_ignores}, n_samples={n_samples}"
+        self.display = display
 
         # data: generated, or loaded from file
         if fdata != '' and os.path.exists(fdata):
@@ -128,7 +135,8 @@ class FlipFlopAutomaton:
 
     def sample_length(self, key):
         if self.random_length:
-            return int(jr.choice(key, jnp.arange(1, self.T+1)))
+            raise NotImplementedError("Random length not implemented")
+            # return int(jr.choice(key, jnp.arange(1, self.T+1)))
         return self.T
 
     def __len__(self):
@@ -151,6 +159,241 @@ def get_flipflop_labels(seq):
     return labels
 
 
+class PermutationAutomaton:
+    """
+    Parent class for permutation-group automata.
+    Subclasses: SymmetricAutomaton, AlternatingAutomaton
+    """
+
+    def __init__(
+        self,
+        n_states,
+        length,
+        random_length,
+        seed,
+        n_samples,
+        label_type,
+        fdata="",
+    ):
+        self.n_states = int(n_states)  # number of objects being permuted
+        self.length = int(length)
+        self.random_length = int(random_length)
+        self.seed = int(seed)
+        self.n_samples = int(n_samples)
+        self.label_type = str(label_type)  # 'state' or 'first_chair'
+        self.fdata = fdata
+
+        self.np_rng = np.random.default_rng(self.seed)
+
+        # Subclasses must define:
+        # - self.actions: dict[int -> np.ndarray] (permutation matrices)
+        # - self.n_actions: int
+        # - self.state_encode: callable(state_vec)->str
+        # - self.state_label_map: dict[str->int]
+        self.X = None
+        self.y = None
+
+        self.__info__ = (
+            "  - label_type (str): choosing from the following options:\n"
+            "    - 'state' (default): the state id.\n"
+            "    - 'first_chair': the element in the first position of the permutation.\n"
+            "          e.g. if the current permutation is [2,1,4,3], then 'first_chair' is 2.\n"
+        )
+
+    def get_state_label(self, state_vec):
+        enc = self.state_encode(state_vec)
+        return self.state_label_map[enc]
+
+    def f(self, x):
+        curr_state = np.arange(self.n_states)
+        labels = []
+        for action_id in x:
+            curr_state = self.actions[int(action_id)].dot(curr_state)
+            if self.label_type == "state":
+                labels.append(self.get_state_label(curr_state))
+            elif self.label_type == "first_chair":
+                labels.append(int(curr_state[0]))
+            else:
+                raise ValueError(f"Unknown label_type: {self.label_type}")
+        return np.asarray(labels, dtype=np.int32)
+
+    def sample_length(self):
+        if self.random_length:
+            # variable-length would create ragged arrays; keep parity with torch code
+            return int(self.np_rng.choice(range(1, self.length + 1)))
+        return self.length
+
+    def sample(self):
+        T = self.sample_length()
+        x = self.np_rng.choice(range(self.n_actions), replace=True, size=T).astype(np.int32)
+        y = self.f(x)
+        return x, y
+
+    def _init_samples(self):
+        if self.fdata != "" and os.path.exists(self.fdata):
+            with open(self.fdata, "rb") as f:
+                samples = pickle.load(f)
+            self.X = jnp.asarray(samples["X"], dtype=jnp.int32)
+            self.y = jnp.asarray(samples["y"], dtype=jnp.int32)
+            self.n_samples = int(len(self.X))
+            return
+
+        X = []
+        y = []
+        for _ in tqdm(range(self.n_samples), desc="Generating samples"):
+            xi, yi = self.sample()
+            X.append(xi)
+            y.append(yi)
+
+        # These tasks are typically fixed-length; if random_length is enabled,
+        # numpy will create dtype=object and this will fail (intended).
+        self.X = jnp.asarray(np.asarray(X), dtype=jnp.int32)
+        self.y = jnp.asarray(np.asarray(y), dtype=jnp.int32)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+    def __len__(self):
+        return int(len(self.X)) if self.X is not None else int(self.n_samples)
+
+
+class SymmetricAutomaton(PermutationAutomaton):
+    def __init__(
+        self,
+        n_states,
+        length,
+        random_length,
+        seed,
+        label_type,
+        n_actions,
+        n_samples,
+        fdata="",
+    ):
+        super().__init__(
+            n_states=n_states,
+            length=length,
+            random_length=random_length,
+            seed=seed,
+            n_samples=n_samples,
+            label_type=label_type,
+            fdata=fdata,
+        )
+
+        self.name = f"S{self.n_states}"
+
+        # State encoding / labeling: enumerate all permutations of 0..n-1
+        self.state_encode = lambda state: "".join(str(int(each)) for each in state)
+        self.state_label_map = {}
+        for si, state in enumerate(itertools.permutations(range(self.n_states))):
+            self.state_label_map[self.state_encode(state)] = int(si)
+
+        # Actions (default 3): id, shift-by-1, swap-first-two, plus optional extras
+        self.n_actions = int(n_actions)
+        self.actions = {0: np.eye(self.n_states, dtype=np.int32)}
+        shift_idx = list(range(1, self.n_states)) + [0]
+        self.actions[1] = np.eye(self.n_states, dtype=np.int32)[shift_idx]
+        swap_idx = [1, 0] + list(range(2, self.n_states))
+        self.actions[2] = np.eye(self.n_states, dtype=np.int32)[swap_idx]
+
+        if self.n_actions > 3:
+            # Add additional permutations in itertools.permutations order, skipping duplicates
+            all_perms = list(itertools.permutations(range(self.n_states)))[1:]
+            cnt = 2
+            for perm in all_perms:
+                action = np.eye(self.n_states, dtype=np.int32)[list(perm)]
+                if np.array_equal(action, self.actions[0]) or np.array_equal(action, self.actions[1]):
+                    continue
+                self.actions[cnt] = action
+                cnt += 1
+                if cnt == self.n_actions:
+                    break
+
+        self.__info__ = (
+            f"Symmetric group on n={self.n_states} objects:\n"
+            f"- Inputs: tokens are either 0 (no-op), or 1:{self.n_actions} (corresponding to {self.n_actions} permutations).\n"
+            "- Labels: depending on 'label_type'.\n"
+            "- Config:\n"
+            "  - n_states (int): number of objects, i.e. there are n! states.\n"
+            "  - n_actions (int): number of permutations to include in the generator set;\n"
+            "        the ordering is given by itertools.permutations, and the first 'n_actions' permutations will be included.\n"
+            + self.__info__
+        )
+
+        self._init_samples()
+
+
+def _is_even_permutation(perm):
+    """
+    Return True iff perm (tuple/list of 0..n-1) is even.
+    Uses inversion parity (O(n^2)), fine for small n.
+    """
+    inv = 0
+    p = list(perm)
+    n = len(p)
+    for i in range(n):
+        pi = p[i]
+        for j in range(i + 1, n):
+            inv += 1 if pi > p[j] else 0
+    return (inv % 2) == 0
+
+
+class AlternatingAutomaton(PermutationAutomaton):
+    def __init__(
+        self,
+        n_states,
+        length,
+        random_length,
+        seed,
+        label_type,
+        n_samples,
+        fdata="",
+    ):
+        super().__init__(
+            n_states=n_states,
+            length=length,
+            random_length=random_length,
+            seed=seed,
+            n_samples=n_samples,
+            label_type=label_type,
+            fdata=fdata,
+        )
+
+        self.name = f"A{self.n_states}"
+
+        # State labeling: only even permutations
+        self.state_encode = lambda state: "".join(str(int(each)) for each in state)
+        self.state_label_map = {}
+        cnt = 0
+        for state in itertools.permutations(range(self.n_states)):
+            if not _is_even_permutation(state):
+                continue
+            self.state_label_map[self.state_encode(state)] = int(cnt)
+            cnt += 1
+
+        # Actions: all 3-cycles of the form (12x) for x in [2..n-1]
+        self.actions = {0: np.eye(self.n_states, dtype=np.int32)}
+        for idx in range(2, self.n_states):
+            shift_idx = list(range(self.n_states))
+            shift_idx[0], shift_idx[1], shift_idx[idx] = (
+                shift_idx[1],
+                shift_idx[idx],
+                shift_idx[0],
+            )
+            self.actions[idx - 1] = np.eye(self.n_states, dtype=np.int32)[shift_idx]
+        self.n_actions = int(len(self.actions))
+
+        self.__info__ = (
+            f"Alternating group on n={self.n_states} objects:\n"
+            f"- Inputs: tokens from 0 to n-3, corresponding to all 3-cycles of the form (12x).\n"
+            "- Labels: depending on 'label_type'.\n"
+            "- Config:\n"
+            "  - n_states (int): number of objects, i.e. there are n!/2 states.\n"
+            + self.__info__
+        )
+
+        self._init_samples()
+
+
 def get_loaders(cfg_data):
     """
     Returns data generators compatible with JAX training loops.
@@ -160,14 +403,92 @@ def get_loaders(cfg_data):
         train_set = FlipFlopAutomaton(cfg_data.n_states, cfg_data.length, cfg_data.random_length, cfg_data.seed,
                                       cfg_data.n_ignores_train, cfg_data.p_ignores_train, cfg_data.n_samples_train,
                                       cfg_data.fdata_train)
-        val_set = FlipFlopAutomaton(cfg_data.n_states, cfg_data.length, cfg_data.random_length, cfg_data.seed,
-                                    cfg_data.n_ignores_val, cfg_data.p_ignores_val, cfg_data.n_samples_val,
-                                    cfg_data.fdata_val)
+        if cfg_data.eval_separately:
+            if cfg_data.n_ignores_val != '':
+                # eval separately for each ignore number
+                n_ignore_val_list = [str(each) for each in cfg_data.n_ignores_val.split(';')]
+                val_set_list = []
+                for n_ignore_val in n_ignore_val_list:
+                    display = f"n_ignores={n_ignore_val}"
+                    val_set = FlipFlopAutomaton(
+                        cfg_data.n_states,
+                        cfg_data.length,
+                        cfg_data.random_length,
+                        cfg_data.seed,
+                        n_ignores=n_ignore_val,
+                        p_ignores=cfg_data.p_ignores_val,
+                        n_samples=cfg_data.n_samples_val,
+                        fdata=cfg_data.fdata_val,
+                        display=display
+                    )
+                    val_set_list.append(val_set)
+            else:
+                # eval separately for each ignore percentage
+                p_ignores_val_list = [float(each) for each in cfg_data.p_ignores_val.split(';')]
+                val_set_list = []
+                for p_ignores_val in p_ignores_val_list:
+                    display = f"p_ignores={p_ignores_val}"
+                    val_set = FlipFlopAutomaton(
+                        cfg_data.n_states,
+                        cfg_data.length,
+                        cfg_data.random_length,
+                        cfg_data.seed,
+                        cfg_data.n_ignores_val,
+                        p_ignores_val,
+                        cfg_data.n_samples_val,
+                        cfg_data.fdata_val,
+                        display=display,
+                    )
+                    val_set_list.append(val_set)
+        else:
+            val_set = FlipFlopAutomaton(cfg_data.n_states, cfg_data.length, cfg_data.random_length, cfg_data.seed,
+                                        cfg_data.n_ignores_val, cfg_data.p_ignores_val, cfg_data.n_samples_val,
+                                        cfg_data.fdata_val)
+    elif cfg_data.task == "symmetric":
+        train_set = SymmetricAutomaton(
+            cfg_data.n_states,
+            cfg_data.length,
+            cfg_data.random_length,
+            cfg_data.seed,
+            cfg_data.label_type,
+            cfg_data.n_actions,
+            cfg_data.n_samples_train,
+            cfg_data.fdata_train,
+        )
+        val_set = SymmetricAutomaton(
+            cfg_data.n_states,
+            cfg_data.length,
+            cfg_data.random_length,
+            cfg_data.seed,
+            cfg_data.label_type,
+            cfg_data.n_actions,
+            cfg_data.n_samples_val,
+            cfg_data.fdata_val,
+        )
+    elif cfg_data.task == "alternating":
+        train_set = AlternatingAutomaton(
+            cfg_data.n_states,
+            cfg_data.length,
+            cfg_data.random_length,
+            cfg_data.seed,
+            cfg_data.label_type,
+            cfg_data.n_samples_train,
+            cfg_data.fdata_train,
+        )
+        val_set = AlternatingAutomaton(
+            cfg_data.n_states,
+            cfg_data.length,
+            cfg_data.random_length,
+            cfg_data.seed,
+            cfg_data.label_type,
+            cfg_data.n_samples_val,
+            cfg_data.fdata_val,
+        )
     else:
         raise ValueError(f"Task {cfg_data.task} not supported")
     
     def batch_generator(dataset, batch_size, shuffle=True, key=None):
-        """Generate batches from dataset. Uses direct array indexing (no per-sample .item() syncs)."""
+        """Generate batches from dataset."""
         n_samples = len(dataset)
         indices = jnp.arange(n_samples)
         if shuffle:
@@ -179,17 +500,35 @@ def get_loaders(cfg_data):
             batch_indices = indices[i:i + batch_size]
             batch_x = dataset.X[batch_indices]
             batch_y = dataset.y[batch_indices]
-            # Vectorized ignore percentage per sample (no device round-trips)
-            batch_ignore = (batch_x == 0).astype(jnp.float32).mean(axis=-1)
-            yield batch_x, batch_y, batch_ignore
+            if getattr(dataset, "name", None) == "flipflop":
+                batch_ignore = (batch_x == 0).astype(jnp.float32).mean(axis=-1)
+                yield batch_x, batch_y, batch_ignore
+            else:
+                yield batch_x, batch_y
     
     def train_loader(key=None):
         return batch_generator(train_set, cfg_data.batch_size, shuffle=True, key=key)
-    
-    def val_loader(key=None):
-        return batch_generator(val_set, cfg_data.eval_batch_size, shuffle=False, key=key)
-    
-    return train_loader, val_loader
+
+    # Build validation loaders
+    if cfg_data.task == 'flipflop' and cfg_data.eval_separately:
+        val_loaders = []
+
+        for val_set in val_set_list:
+            def make_val_loader(vs):
+                def val_loader(key=None):
+                    return batch_generator(vs, cfg_data.eval_batch_size, shuffle=False, key=key)
+                # Attach display attribute so callers can log with it
+                val_loader.display = vs.display
+                return val_loader
+
+            val_loaders.append(make_val_loader(val_set))
+
+        return train_loader, val_loaders
+    else:
+        def val_loader(key=None):
+            return batch_generator(val_set, cfg_data.eval_batch_size, shuffle=False, key=key)
+
+        return train_loader, val_loader
 
 
 def get_adv_example(model, xs, ys, n_states, n_iters=10, n_random_pos=5,

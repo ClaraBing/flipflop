@@ -15,9 +15,16 @@ from hydra.utils import get_original_cwd
 import datetime
 import wandb
 
+import math
+
 from src.transformer import Transformer
 from src.opt import Adam, SGD
-from src.utils_data import get_loaders, FlipFlopAutomaton
+from src.utils_data import (
+    get_loaders,
+    FlipFlopAutomaton,
+    SymmetricAutomaton,
+    AlternatingAutomaton,
+)
 
 VERBOSE = 0
 N_VALS_TO_LOG = 10
@@ -37,34 +44,85 @@ def main(cfg: DictConfig):
     # Get the loaders & model
     ##########################################################################
     train_loader_fn, val_loader_fn = get_loaders(cfg.data)
-    
-    # Get dataset to determine vocab size
-    train_set = None
-    for batch in train_loader_fn():
-        # Create a dummy dataset to get n_states
-        # We'll need to access the dataset directly
-        break
-    
-    # We need to create the datasets to get n_states
-    # Let's recreate them temporarily
-    temp_train_set = FlipFlopAutomaton(
-        cfg.data.n_states, cfg.data.length, cfg.data.random_length, cfg.data.seed,
-        cfg.data.n_ignores_train, cfg.data.p_ignores_train, cfg.data.n_samples_train,
-        cfg.data.fdata_train
-    )
-    temp_val_set = FlipFlopAutomaton(
-        cfg.data.n_states, cfg.data.length, cfg.data.random_length, cfg.data.seed,
-        cfg.data.n_ignores_val, cfg.data.p_ignores_val, cfg.data.n_samples_val,
-        cfg.data.fdata_val
-    )
+
+    # Recreate datasets temporarily to determine n_samples and vocab size.
+    if cfg.data.task == "flipflop":
+        temp_train_set = FlipFlopAutomaton(
+            cfg.data.n_states,
+            cfg.data.length,
+            cfg.data.random_length,
+            cfg.data.seed,
+            cfg.data.n_ignores_train,
+            cfg.data.p_ignores_train,
+            cfg.data.n_samples_train,
+            cfg.data.fdata_train,
+        )
+        temp_val_set = FlipFlopAutomaton(
+            cfg.data.n_states,
+            cfg.data.length,
+            cfg.data.random_length,
+            cfg.data.seed,
+            cfg.data.n_ignores_val,
+            cfg.data.p_ignores_val,
+            cfg.data.n_samples_val,
+            cfg.data.fdata_val,
+        )
+    elif cfg.data.task == "symmetric":
+        temp_train_set = SymmetricAutomaton(
+            cfg.data.n_states,
+            cfg.data.length,
+            cfg.data.random_length,
+            cfg.data.seed,
+            cfg.data.label_type,
+            cfg.data.n_actions,
+            cfg.data.n_samples_train,
+            cfg.data.fdata_train,
+        )
+        temp_val_set = SymmetricAutomaton(
+            cfg.data.n_states,
+            cfg.data.length,
+            cfg.data.random_length,
+            cfg.data.seed,
+            cfg.data.label_type,
+            cfg.data.n_actions,
+            cfg.data.n_samples_val,
+            cfg.data.fdata_val,
+        )
+    elif cfg.data.task == "alternating":
+        temp_train_set = AlternatingAutomaton(
+            cfg.data.n_states,
+            cfg.data.length,
+            cfg.data.random_length,
+            cfg.data.seed,
+            cfg.data.label_type,
+            cfg.data.n_samples_train,
+            cfg.data.fdata_train,
+        )
+        temp_val_set = AlternatingAutomaton(
+            cfg.data.n_states,
+            cfg.data.length,
+            cfg.data.random_length,
+            cfg.data.seed,
+            cfg.data.label_type,
+            cfg.data.n_samples_val,
+            cfg.data.fdata_val,
+        )
+    else:
+        raise ValueError(f"Task {cfg.data.task} not supported")
     
     cfg.data.n_samples_train = len(temp_train_set)
     cfg.data.n_samples_val = len(temp_val_set)
 
     # Determine vocab size
     if cfg.model.V == -1:
-        num_tokens = temp_train_set.n_states + 1  # +1 for the ignore token
-        cfg.model.V = num_tokens
+        if cfg.data.task == "flipflop":
+            num_tokens = temp_train_set.n_states + 1  # +1 for the ignore token
+        elif cfg.data.task in ("symmetric", "alternating"):
+            # Keep parity with torch training script: vocab_size = n!
+            num_tokens = int(math.factorial(int(temp_train_set.n_states)))
+        else:
+            raise ValueError(f"Task {cfg.data.task} not supported")
+        cfg.model.V = int(num_tokens)
     
     # Initialize model
     model = Transformer(
@@ -143,6 +201,7 @@ def main(cfg: DictConfig):
         # Setup learning rate schedule
         total_steps = cfg.data.n_samples_train // cfg.data.batch_size * epochs
         if lr_schedule == 'cosine':
+            # Schedule as multiplier: 1.0 -> eta_min/lr so effective_lr = lr * schedule(step)
             schedule = optax.cosine_decay_schedule(
                 init_value=lr,
                 decay_steps=total_steps,
@@ -211,9 +270,8 @@ def main(cfg: DictConfig):
             all_seq_worst_pred = []
             val_loader = val_loader_fn()
             for batch in val_loader:
-                xv, yv, _ = batch
-                xv = jnp.asarray(xv, dtype=jnp.int32)
-                yv = jnp.asarray(yv, dtype=jnp.int32)
+                xv = jnp.asarray(batch[0], dtype=jnp.int32)
+                yv = jnp.asarray(batch[1], dtype=jnp.int32)
                 batch_loss, batch_acc, logits_v, loss_per_seq, acc_v_by_seq = eval_batch_jit(params, xv, yv)
                 val_losses.append(float(batch_loss))
                 val_accs.append(float(batch_acc))
@@ -253,10 +311,12 @@ def main(cfg: DictConfig):
             train_loader = train_loader_fn(key=train_key)
             
             for batch in tqdm(train_loader, desc=f"Epoch {epoch_i+1}/{epochs}"):
-                x, y, ignore_percentage = batch
-                x = jnp.asarray(x, dtype=jnp.int32)
-                y = jnp.asarray(y, dtype=jnp.int32)
-                ignore_percentage = jnp.asarray(ignore_percentage, dtype=jnp.float32)
+                x = jnp.asarray(batch[0], dtype=jnp.int32)
+                y = jnp.asarray(batch[1], dtype=jnp.int32)
+                if len(batch) == 3:
+                    ignore_percentage = jnp.asarray(batch[2], dtype=jnp.float32)
+                else:
+                    ignore_percentage = None
 
                 # Single jitted step (forward + backward + optimizer update)
                 params, opt_state, loss = step_fn(params, opt_state, x, y, ignore_percentage)
@@ -277,27 +337,69 @@ def main(cfg: DictConfig):
                     train_batch_acc = float((jnp.argmax(logits, axis=-1) == y).astype(jnp.float32).mean())
                     avg_train_loss = np.mean(train_losses[-10:])
                     
-                    # Evaluate on val set (uses jitted apply inside)
-                    val_loss, val_acc, worst_samples = eval_model(
-                        apply_fn, params, val_loader_fn, n_worst_samples=n_worst_samples
-                    )
+                    # Evaluate on val set(s) (uses jitted apply inside)
+                    if isinstance(val_loader_fn, (list, tuple)):
+                        per_val_losses = []
+                        per_val_accs = []
+                        log_dict = {
+                            'train_loss': avg_train_loss,
+                            'train_batch_acc': train_batch_acc,
+                            'curr_lr': curr_lr,
+                        }
+
+                        for val_loader in val_loader_fn:
+                            val_loss_i, val_acc_i, worst_samples = eval_model(
+                                apply_fn, params, val_loader, n_worst_samples=n_worst_samples
+                            )
+                            per_val_losses.append(val_loss_i)
+                            per_val_accs.append(val_acc_i)
+
+                            # Log separate metrics per validation loader
+                            display_name = getattr(val_loader, "display", "val")
+                            log_dict[f"val_loss_{display_name}"] = val_loss_i
+                            log_dict[f"val_acc_{display_name}"] = val_acc_i
+
+                        # Aggregate for tracking best/early stopping
+                        val_loss = float(np.mean(per_val_losses))
+                        val_acc = float(np.mean(per_val_accs))
+                    else:
+                        val_loss, val_acc, worst_samples = eval_model(
+                            apply_fn, params, val_loader_fn, n_worst_samples=n_worst_samples
+                        )
+                        log_dict = {
+                            'train_loss': avg_train_loss,
+                            'train_batch_acc': train_batch_acc,
+                            'val_loss': val_loss,
+                            'val_acc': val_acc,
+                            'curr_lr': curr_lr,
+                        }
+
                     val_losses.append(val_loss)
                     val_accs.append(val_acc)
-
-                    # Log to wandb
-                    log_dict = {
-                        'train_loss': avg_train_loss,
-                        'train_batch_acc': train_batch_acc,
-                        'val_loss': val_losses[-1],
-                        'val_acc': val_accs[-1],
-                        'curr_lr': curr_lr,
-                    }
                     
                     # Log model weight norms (single device sync via device_get)
                     params_cpu = jax.device_get(params)
                     weight_norms = {}
+                    def _path_elem_to_str(p):
+                        """Format one path element for logging: no brackets, show indices/names clearly."""
+                        if isinstance(p, (int, np.integer)):
+                            return str(int(p))
+                        if isinstance(p, str):
+                            return p
+                        if isinstance(p, (list, tuple)):
+                            return '_'.join(_path_elem_to_str(x) for x in p)
+                        s = str(p)
+                        # Strip bracket notation e.g. "['head']" -> "head", "(0,)" -> "0"
+                        if (s.startswith('[') and s.endswith(']')) or (s.startswith('(') and s.endswith(')')):
+                            inner = s[1:-1].strip()
+                            if not inner:
+                                return s
+                            if ',' in inner:
+                                return '_'.join(part.strip().strip("'\"") for part in inner.split(','))
+                            return inner.strip("'\"")
+                        return s
                     def _log_norms(path, param):
-                        name = '/'.join(str(p) for p in path)
+                        name = '/'.join(_path_elem_to_str(p) for p in path)
                         p = np.asarray(param)
                         weight_norms[name + '_l1'] = float(np.abs(p).sum())
                         weight_norms[name + '_l2'] = float(np.linalg.norm(p))
